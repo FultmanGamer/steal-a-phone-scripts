@@ -1,0 +1,663 @@
+local Players = game:GetService("Players")
+local UIS = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local VIM = game:GetService("VirtualInputManager")
+
+local lp = Players.LocalPlayer
+local char = lp.Character or lp.CharacterAdded:Wait()
+local hrp = char:WaitForChild("HumanoidRootPart")
+
+local NPCFolder = game.Workspace.AddOns.NPCSpawned
+local PlotsFolder = game.Workspace.Map.Plots
+
+local currentFilter = ""
+local rebuildingStealer = false
+local rebuildingInventory = false
+
+---------------------------------------------------------------------
+-- PRICE PARSER
+---------------------------------------------------------------------
+local multipliers = {K = 1e3, M = 1e6, B = 1e9, T = 1e12, Q = 1e15}
+
+local function parsePrice(text)
+    if not text then return math.huge end
+    text = text:upper()
+    if text == "FREE" then return math.huge end
+    local number = tonumber(text:match("([%d%.]+)"))
+    local suffix = text:match("([A-Z]+)$")
+    if not number then return math.huge end
+    if suffix and multipliers[suffix] then
+        return number * multipliers[suffix]
+    end
+    return number
+end
+
+---------------------------------------------------------------------
+-- FIND LABELS INSIDE NPCOverhead
+---------------------------------------------------------------------
+local function findLabel(overhead, name)
+    for _, d in ipairs(overhead:GetDescendants()) do
+        if d:IsA("TextLabel") and d.Name == name then
+            return d.Text
+        end
+    end
+    return nil
+end
+
+---------------------------------------------------------------------
+-- TELEPORT + FOLLOW
+---------------------------------------------------------------------
+local function tp(pos)
+    hrp.CFrame = CFrame.new(pos)
+end
+
+local function smoothFollow(npc)
+    local root = npc:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    for _ = 1, 40 do
+        if not root.Parent then break end
+        local dist = (hrp.Position - root.Position).Magnitude
+        if dist <= 10 then break end
+        hrp.CFrame = hrp.CFrame:Lerp(CFrame.new(root.Position + Vector3.new(0, 2, 0)), 0.35)
+        task.wait(0.05)
+    end
+end
+
+local function holdPrompt()
+    VIM:SendKeyEvent(true, Enum.KeyCode.E, false, game)
+    task.wait(1)
+    VIM:SendKeyEvent(false, Enum.KeyCode.E, false, game)
+end
+
+---------------------------------------------------------------------
+-- FIND PLAYER PLOT
+---------------------------------------------------------------------
+local function findPlayerPlot()
+    local name = lp.Name:lower()
+    for _, plot in ipairs(PlotsFolder:GetChildren()) do
+        local oe = plot:FindFirstChild("OutsideEssentials")
+        local ps = oe and oe:FindFirstChild("PlotSign")
+        local ts = ps and ps:FindFirstChild("TextSign")
+        local sg = ts and ts:FindFirstChild("SurfaceGui")
+        local frame = sg and sg:FindFirstChild("Frame")
+        local label = frame and frame:FindFirstChild("TextLabel")
+        if label and label.Text:lower():find(name) then
+            return plot
+        end
+    end
+end
+
+---------------------------------------------------------------------
+-- GUI ROOT
+---------------------------------------------------------------------
+local gui = Instance.new("ScreenGui")
+gui.Name = "PSUI"
+gui.ResetOnSpawn = false
+gui.Parent = lp:WaitForChild("PlayerGui")
+
+---------------------------------------------------------------------
+-- MAIN WINDOW (DRAGGABLE)
+---------------------------------------------------------------------
+local main = Instance.new("Frame")
+main.Size = UDim2.new(0, 480, 0, 420)
+main.Position = UDim2.new(0.5, -240, 0.5, -210)
+main.BackgroundColor3 = Color3.fromRGB(18, 20, 26)
+main.Parent = gui
+Instance.new("UICorner", main).CornerRadius = UDim.new(0, 10)
+
+do
+    local dragging = false
+    local dragStart, startPos
+    local dragInput
+
+    main.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = true
+            dragStart = input.Position
+            startPos = main.Position
+        end
+    end)
+
+    main.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            dragging = false
+        end
+    end)
+
+    UIS.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement then
+            dragInput = input
+        end
+        if dragging and input == dragInput then
+            local delta = input.Position - dragStart
+            main.Position = UDim2.new(
+                startPos.X.Scale,
+                startPos.X.Offset + delta.X,
+                startPos.Y.Scale,
+                startPos.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+
+---------------------------------------------------------------------
+-- INTERNAL SIDEBAR (EMOJI TABS + MINIMIZE BUTTON)
+---------------------------------------------------------------------
+local sidebar = Instance.new("Frame")
+sidebar.Size = UDim2.new(0, 60, 1, 0)
+sidebar.Position = UDim2.new(0, 0, 0, 0)
+sidebar.BackgroundColor3 = Color3.fromRGB(15, 17, 22)
+sidebar.Parent = main
+Instance.new("UICorner", sidebar).CornerRadius = UDim.new(0, 10)
+
+local sidebarOpen = true
+
+local toggleBtn = Instance.new("TextButton")
+toggleBtn.Size = UDim2.new(0, 20, 0, 40)
+toggleBtn.Position = UDim2.new(0, 5, 0, 10)
+toggleBtn.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+toggleBtn.Text = "<"
+toggleBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+toggleBtn.Font = Enum.Font.GothamBold
+toggleBtn.TextSize = 18
+toggleBtn.Parent = sidebar
+Instance.new("UICorner", toggleBtn).CornerRadius = UDim.new(0, 6)
+
+local function makeTabButton(emoji, order)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 40, 0, 40)
+    btn.Position = UDim2.new(0, 10, 0, 60 + (order * 60))
+    btn.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+    btn.Text = emoji
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 22
+    btn.Parent = sidebar
+
+    local c = Instance.new("UICorner")
+    c.CornerRadius = UDim.new(0, 10)
+    c.Parent = btn
+
+    return btn
+end
+
+local stealerBtn = makeTabButton("📱", 0)
+local inventoryBtn = makeTabButton("📦", 1)
+
+local function setSidebarState(open)
+    sidebarOpen = open
+    if sidebarOpen then
+        toggleBtn.Text = "<"
+        stealerBtn.Visible = true
+        inventoryBtn.Visible = true
+    else
+        toggleBtn.Text = ">"
+        stealerBtn.Visible = false
+        inventoryBtn.Visible = false
+    end
+end
+
+local function toggleSidebar()
+    setSidebarState(not sidebarOpen)
+end
+
+toggleBtn.MouseButton1Click:Connect(toggleSidebar)
+setSidebarState(true)
+
+---------------------------------------------------------------------
+-- TAB FRAMES
+---------------------------------------------------------------------
+local stealerTab = Instance.new("Frame")
+stealerTab.Size = UDim2.new(1, -60, 1, 0)
+stealerTab.Position = UDim2.new(0, 60, 0, 0)
+stealerTab.BackgroundTransparency = 1
+stealerTab.Parent = main
+
+local inventoryTab = Instance.new("Frame")
+inventoryTab.Size = UDim2.new(1, -60, 1, 0)
+inventoryTab.Position = UDim2.new(0, 60, 0, 0)
+inventoryTab.BackgroundTransparency = 1
+inventoryTab.Visible = false
+inventoryTab.Parent = main
+
+local function showTab(tab)
+    stealerTab.Visible = false
+    inventoryTab.Visible = false
+    tab.Visible = true
+end
+
+stealerBtn.MouseButton1Click:Connect(function()
+    showTab(stealerTab)
+end)
+
+inventoryBtn.MouseButton1Click:Connect(function()
+    showTab(inventoryTab)
+end)
+
+---------------------------------------------------------------------
+-- STEALER TAB UI
+---------------------------------------------------------------------
+local titleStealer = Instance.new("TextLabel")
+titleStealer.Size = UDim2.new(1, 0, 0, 40)
+titleStealer.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+titleStealer.Text = "PHONE STEALER"
+titleStealer.TextColor3 = Color3.fromRGB(255, 255, 255)
+titleStealer.Font = Enum.Font.GothamBold
+titleStealer.TextSize = 22
+titleStealer.Parent = stealerTab
+Instance.new("UICorner", titleStealer).CornerRadius = UDim.new(0, 10)
+
+local searchBox = Instance.new("TextBox")
+searchBox.Name = "SearchBox"
+searchBox.Size = UDim2.new(1, -20, 0, 30)
+searchBox.Position = UDim2.new(0, 10, 0, 50)
+searchBox.BackgroundColor3 = Color3.fromRGB(24, 28, 38)
+searchBox.PlaceholderText = "Search anything..."
+searchBox.Text = ""
+searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 150)
+searchBox.Font = Enum.Font.Gotham
+searchBox.TextSize = 16
+searchBox.ClearTextOnFocus = false
+searchBox.Parent = stealerTab
+Instance.new("UICorner", searchBox).CornerRadius = UDim.new(0, 8)
+for _, child in ipairs(searchBox:GetChildren()) do child:Destroy() end
+
+local listFrame = Instance.new("ScrollingFrame")
+listFrame.Size = UDim2.new(1, -20, 1, -100)
+listFrame.Position = UDim2.new(0, 10, 0, 90)
+listFrame.BackgroundTransparency = 1
+listFrame.ScrollBarThickness = 6
+listFrame.Parent = stealerTab
+
+local layout = Instance.new("UIListLayout")
+layout.SortOrder = Enum.SortOrder.LayoutOrder
+layout.Padding = UDim.new(0, 4)
+layout.Parent = listFrame
+
+local loadingLabel = Instance.new("TextLabel")
+loadingLabel.Size = UDim2.new(1, 0, 0, 20)
+loadingLabel.Position = UDim2.new(0, 0, 1, -20)
+loadingLabel.BackgroundTransparency = 1
+loadingLabel.TextColor3 = Color3.fromRGB(200, 200, 200)
+loadingLabel.Font = Enum.Font.Gotham
+loadingLabel.TextSize = 14
+loadingLabel.Parent = stealerTab
+
+local function clearStealerList()
+    for _, c in ipairs(listFrame:GetChildren()) do
+        if c:IsA("Frame") or (c:IsA("TextLabel") and c ~= loadingLabel) then
+            c:Destroy()
+        end
+    end
+end
+
+local function buildStealerList()
+    if rebuildingStealer then return end
+    rebuildingStealer = true
+    loadingLabel.Text = "Loading..."
+    clearStealerList()
+    task.wait(0.05)
+
+    local entries = {}
+    for _, model in ipairs(NPCFolder:GetChildren()) do
+        local head = model:FindFirstChild("Head")
+        local uiAtt = head and head:FindFirstChild("UIAtt")
+        local overhead = uiAtt and uiAtt:FindFirstChild("NPCOverhead")
+        if overhead then
+            local price = findLabel(overhead, "Price") or "FREE"
+            local rarity = findLabel(overhead, "Rarity") or "Unknown"
+            local gen = findLabel(overhead, "Generation") or "?"
+            local desc = string.format("%s • %s • Gen %s • %s", model.Name, rarity, gen, price)
+            if currentFilter == "" or desc:lower():find(currentFilter:lower(), 1, true) then
+                table.insert(entries, {
+                    Model = model,
+                    PriceText = price,
+                    PriceValue = parsePrice(price),
+                    Rarity = rarity,
+                    Generation = gen
+                })
+            end
+        end
+    end
+
+    table.sort(entries, function(a, b)
+        if a.PriceValue == math.huge and b.PriceValue ~= math.huge then
+            return false
+        elseif b.PriceValue == math.huge and a.PriceValue ~= math.huge then
+            return true
+        end
+        return a.PriceValue > b.PriceValue
+    end)
+
+    if #entries == 0 then
+        local row = Instance.new("TextLabel")
+        row.Size = UDim2.new(1, 0, 0, 40)
+        row.BackgroundTransparency = 1
+        row.Text = "No NPCs Found..."
+        row.TextColor3 = Color3.fromRGB(200, 200, 200)
+        row.Font = Enum.Font.Gotham
+        row.TextSize = 18
+        row.Parent = listFrame
+        task.wait()
+        listFrame.CanvasSize = UDim2.new(0, 0, 0, 40)
+        loadingLabel.Text = ""
+        rebuildingStealer = false
+        return
+    end
+
+    for _, data in ipairs(entries) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, 0, 0, 60)
+        row.BackgroundColor3 = Color3.fromRGB(26, 30, 42)
+        row.Parent = listFrame
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+        local name = Instance.new("TextLabel")
+        name.Size = UDim2.new(0.6, -10, 0, 24)
+        name.Position = UDim2.new(0, 8, 0, 4)
+        name.BackgroundTransparency = 1
+        name.Text = data.Model.Name
+        name.TextColor3 = Color3.fromRGB(255, 255, 255)
+        name.Font = Enum.Font.GothamBold
+        name.TextSize = 18
+        name.TextXAlignment = Enum.TextXAlignment.Left
+        name.Parent = row
+
+        local desc = Instance.new("TextLabel")
+        desc.Size = UDim2.new(0.6, -10, 0, 24)
+        desc.Position = UDim2.new(0, 8, 0, 30)
+        desc.BackgroundTransparency = 1
+        desc.Text = data.Rarity .. " • Gen " .. data.Generation .. " • " .. data.PriceText
+        desc.TextColor3 = Color3.fromRGB(180, 180, 180)
+        desc.Font = Enum.Font.Gotham
+        desc.TextSize = 14
+        desc.TextXAlignment = Enum.TextXAlignment.Left
+        desc.Parent = row
+
+        local buy = Instance.new("TextButton")
+        buy.Size = UDim2.new(0.3, -10, 0, 40)
+        buy.Position = UDim2.new(0.7, 0, 0.5, -20)
+        buy.BackgroundColor3 = Color3.fromRGB(0, 140, 255)
+        buy.Text = "BUY"
+        buy.TextColor3 = Color3.fromRGB(255, 255, 255)
+        buy.Font = Enum.Font.GothamBold
+        buy.TextSize = 18
+        buy.Parent = row
+        Instance.new("UICorner", buy).CornerRadius = UDim.new(0, 8)
+
+        buy.MouseButton1Click:Connect(function()
+            local npc = data.Model
+            local root = npc:FindFirstChild("HumanoidRootPart")
+            local prompt = root and root:FindFirstChild("ProximityPrompt")
+            if not (root and prompt) then return end
+            tp(root.Position + Vector3.new(0, 2, 0))
+            smoothFollow(npc)
+            holdPrompt()
+            local plot = findPlayerPlot()
+            if plot then
+                local be = plot:FindFirstChild("BaseEssentials")
+                local ground = be and be:FindFirstChild("Ground")
+                if ground then
+                    tp(ground.Position + Vector3.new(0, 3, 0))
+                end
+            end
+        end)
+    end
+
+    task.wait()
+    listFrame.CanvasSize = UDim2.new(0, 0, 0, layout.AbsoluteContentSize.Y + 10)
+    loadingLabel.Text = ""
+    rebuildingStealer = false
+end
+
+local searchDebounce = false
+searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+    if searchDebounce then return end
+    searchDebounce = true
+    currentFilter = searchBox.Text or ""
+    task.delay(0.08, function()
+        buildStealerList()
+        searchDebounce = false
+    end)
+end)
+
+---------------------------------------------------------------------
+-- INVENTORY TAB UI
+---------------------------------------------------------------------
+local titleInv = Instance.new("TextLabel")
+titleInv.Size = UDim2.new(1, 0, 0, 40)
+titleInv.BackgroundColor3 = Color3.fromRGB(30, 34, 44)
+titleInv.Text = "INVENTORY"
+titleInv.TextColor3 = Color3.fromRGB(255, 255, 255)
+titleInv.Font = Enum.Font.GothamBold
+titleInv.TextSize = 22
+titleInv.Parent = inventoryTab
+Instance.new("UICorner", titleInv).CornerRadius = UDim.new(0, 10)
+
+local invList = Instance.new("ScrollingFrame")
+invList.Size = UDim2.new(1, -20, 1, -60)
+invList.Position = UDim2.new(0, 10, 0, 50)
+invList.BackgroundTransparency = 1
+invList.ScrollBarThickness = 6
+invList.Parent = inventoryTab
+
+local invLayout = Instance.new("UIListLayout")
+invLayout.SortOrder = Enum.SortOrder.LayoutOrder
+invLayout.Padding = UDim.new(0, 4)
+invLayout.Parent = invList
+
+local invLoading = Instance.new("TextLabel")
+invLoading.Size = UDim2.new(1, 0, 0, 20)
+invLoading.Position = UDim2.new(0, 0, 1, -20)
+invLoading.BackgroundTransparency = 1
+invLoading.TextColor3 = Color3.fromRGB(200, 200, 200)
+invLoading.Font = Enum.Font.Gotham
+invLoading.TextSize = 14
+invLoading.Parent = inventoryTab
+
+local function clearInventoryList()
+    for _, c in ipairs(invList:GetChildren()) do
+        if c:IsA("Frame") or c:IsA("TextLabel") then
+            c:Destroy()
+        end
+    end
+end
+
+local function parseCollectValue(text)
+    if not text or text == "" then return 0 end
+    local dollarPart = text:match("%$[%d,%.]+")
+    if not dollarPart then return 0 end
+    local num = dollarPart:match("%$([%d,%.]+)")
+    if not num then return 0 end
+    num = num:gsub(",", "")
+    return tonumber(num) or 0
+end
+
+local watchedPodiums = {}
+
+local function watchPodium(podium)
+    if watchedPodiums[podium] then return end
+    watchedPodiums[podium] = true
+
+    local podiumTouch = podium:FindFirstChild("PodiumTouch")
+    if not podiumTouch then return end
+    local collectFolder = podiumTouch:FindFirstChild("Collect")
+    if not collectFolder then return end
+    local collectLabel = collectFolder:FindFirstChild("Collect")
+    if not (collectLabel and collectLabel:IsA("TextLabel")) then return end
+
+    collectLabel:GetPropertyChangedSignal("Text"):Connect(function()
+        if inventoryTab.Visible then
+            buildInventory()
+        end
+    end)
+end
+
+local function buildInventory()
+    if rebuildingInventory then return end
+    rebuildingInventory = true
+    invLoading.Text = "Loading..."
+    clearInventoryList()
+    task.wait(0.05)
+
+    local plot = findPlayerPlot()
+    if not plot then
+        local row = Instance.new("TextLabel")
+        row.Size = UDim2.new(1, 0, 0, 40)
+        row.BackgroundTransparency = 1
+        row.Text = "No plot found."
+        row.TextColor3 = Color3.fromRGB(200, 200, 200)
+        row.Font = Enum.Font.Gotham
+        row.TextSize = 18
+        row.Parent = invList
+        task.wait()
+        invList.CanvasSize = UDim2.new(0, 0, 0, 40)
+        invLoading.Text = ""
+        rebuildingInventory = false
+        return
+    end
+
+    local inside = plot:FindFirstChild("InsideEssentials")
+    local podiumsFolder = inside and inside:FindFirstChild("NPCPodiums")
+    if not podiumsFolder then
+        local row = Instance.new("TextLabel")
+        row.Size = UDim2.new(1, 0, 0, 40)
+        row.BackgroundTransparency = 1
+        row.Text = "No podiums found."
+        row.TextColor3 = Color3.fromRGB(200, 200, 200)
+        row.Font = Enum.Font.Gotham
+        row.TextSize = 18
+        row.Parent = invList
+        task.wait()
+        invList.CanvasSize = UDim2.new(0, 0, 0, 40)
+        invLoading.Text = ""
+        rebuildingInventory = false
+        return
+    end
+
+    local entries = {}
+    for i = 1, 10 do
+        local podium = podiumsFolder:FindFirstChild(tostring(i))
+        if podium then
+            watchPodium(podium)
+
+            local podiumTouch = podium:FindFirstChild("PodiumTouch")
+            local collectFolder = podiumTouch and podiumTouch:FindFirstChild("Collect")
+            local collectLabel = collectFolder and collectFolder:FindFirstChild("Collect")
+            local collectText = collectLabel and collectLabel:IsA("TextLabel") and collectLabel.Text or nil
+            local collectValue = parseCollectValue(collectText)
+            if collectValue and collectValue > 0 then
+                local spawn = podium:FindFirstChild("Spawn")
+                local attachment = spawn and spawn:FindFirstChild("Attachment")
+                local overhead = attachment and attachment:FindFirstChild("NPCOverhead")
+                if overhead then
+                    local name = findLabel(overhead, "DisplayName") or "Unknown"
+                    local priceText = findLabel(overhead, "Price") or ("$" .. tostring(collectValue))
+                    local rarity = findLabel(overhead, "Rarity") or "Unknown"
+                    local gen = findLabel(overhead, "Generation") or "?"
+                    table.insert(entries, {
+                        Podium = i,
+                        Name = name,
+                        PriceText = priceText,
+                        PriceValue = parsePrice(priceText),
+                        Rarity = rarity,
+                        Generation = gen,
+                        CollectValue = collectValue
+                    })
+                end
+            end
+        end
+    end
+
+    table.sort(entries, function(a, b)
+        if a.PriceValue == math.huge and b.PriceValue ~= math.huge then
+            return false
+        elseif b.PriceValue == math.huge and a.PriceValue ~= math.huge then
+            return true
+        end
+        return a.PriceValue > b.PriceValue
+    end)
+
+    if #entries == 0 then
+        local row = Instance.new("TextLabel")
+        row.Size = UDim2.new(1, 0, 0, 40)
+        row.BackgroundTransparency = 1
+        row.Text = "No phones in inventory."
+        row.TextColor3 = Color3.fromRGB(200, 200, 200)
+        row.Font = Enum.Font.Gotham
+        row.TextSize = 18
+        row.Parent = invList
+        task.wait()
+        invList.CanvasSize = UDim2.new(0, 0, 0, 40)
+        invLoading.Text = ""
+        rebuildingInventory = false
+        return
+    end
+
+    for _, data in ipairs(entries) do
+        local row = Instance.new("Frame")
+        row.Size = UDim2.new(1, 0, 0, 60)
+        row.BackgroundColor3 = Color3.fromRGB(26, 30, 42)
+        row.Parent = invList
+        Instance.new("UICorner", row).CornerRadius = UDim.new(0, 8)
+
+        local name = Instance.new("TextLabel")
+        name.Size = UDim2.new(0.6, -10, 0, 24)
+        name.Position = UDim2.new(0, 8, 0, 4)
+        name.BackgroundTransparency = 1
+        name.Text = string.format("[%d] %s", data.Podium, data.Name)
+        name.TextColor3 = Color3.fromRGB(255, 255, 255)
+        name.Font = Enum.Font.GothamBold
+        name.TextSize = 18
+        name.TextXAlignment = Enum.TextXAlignment.Left
+        name.Parent = row
+
+        local desc = Instance.new("TextLabel")
+        desc.Size = UDim2.new(0.6, -10, 0, 24)
+        desc.Position = UDim2.new(0, 8, 0, 30)
+        desc.BackgroundTransparency = 1
+        desc.Text = data.Rarity .. " • Gen " .. data.Generation .. " • " .. data.PriceText
+        desc.TextColor3 = Color3.fromRGB(180, 180, 180)
+        desc.Font = Enum.Font.Gotham
+        desc.TextSize = 14
+        desc.TextXAlignment = Enum.TextXAlignment.Left
+        desc.Parent = row
+
+        local valueLabel = Instance.new("TextLabel")
+        valueLabel.Size = UDim2.new(0.3, -10, 0, 40)
+        valueLabel.Position = UDim2.new(0.7, 0, 0.5, -20)
+        valueLabel.BackgroundTransparency = 1
+        valueLabel.Text = string.format("$%d", data.CollectValue)
+        valueLabel.TextColor3 = Color3.fromRGB(115, 255, 0)
+        valueLabel.Font = Enum.Font.GothamBold
+        valueLabel.TextSize = 18
+        valueLabel.Parent = row
+    end
+
+    task.wait()
+    invList.CanvasSize = UDim2.new(0, 0, 0, invLayout.AbsoluteContentSize.Y + 10)
+    invLoading.Text = ""
+    rebuildingInventory = false
+end
+
+---------------------------------------------------------------------
+-- EVENTS
+---------------------------------------------------------------------
+NPCFolder.ChildAdded:Connect(buildStealerList)
+NPCFolder.ChildRemoved:Connect(buildStealerList)
+
+UIS.InputBegan:Connect(function(input, gpe)
+    if gpe then return end
+    if input.KeyCode == Enum.KeyCode.F6 then
+        if gui then
+            gui:Destroy()
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- INITIAL BUILD
+---------------------------------------------------------------------
+buildStealerList()
+buildInventory()
